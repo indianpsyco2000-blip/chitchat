@@ -6,8 +6,6 @@
     "dev": "vercel dev"
   },
   "dependencies": {
-    "@huggingface/inference": "^2.6.4",
-    "sentence-transformers": "^3.0.1",
-    "faiss-node": "^0.5.1"
+    "@huggingface/inference": "^2.6.4"
   }
 }
