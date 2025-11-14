@@ -1,52 +1,38 @@
-// api/chat.js
 import { HfInference } from '@huggingface/inference';
-import { SentenceTransformer } from 'sentence-transformers';
-import { IndexFlatL2 } from 'faiss-node';
 import fs from 'fs';
 import path from 'path';
 
-// === CONFIG ===
 const HF_TOKEN = process.env.HF_TOKEN;
 const MODEL = 'mistralai/Mistral-7B-Instruct-v0.2';
-const EMBED_MODEL = 'sentence-transformers/all-MiniLM-L6-v2';
-const CHUNK_SIZE = 500;
-const OVERLAP = 50;
-const K = 3;
+const hf = new HfInference(HF_TOKEN);
 
-// === LAZY INIT (once per container) ===
-let index, chunks, embedder, hf;
-
-async function init() {
-  if (index) return;
-
-  const txtPath = path.join(process.cwd(), 'data', 'ashoka_info.txt');
-  const text = fs.readFileSync(txtPath, 'utf-8');
-
-  // Chunk
-  chunks = chunkText(text, CHUNK_SIZE, OVERLAP);
-
-  // Embed
-  embedder = new SentenceTransformer(EMBED_MODEL);
-  const embeddings = await embedder.encode(chunks);
-  const dim = embeddings[0].length;
-
-  // FAISS
-  index = new IndexFlatL2(dim);
-  index.add(embeddings);
-
-  // HF Client
-  hf = new HfInference(HF_TOKEN);
+// Load and chunk text
+let chunks = [];
+function loadChunks() {
+  if (chunks.length) return;
+  const text = fs.readFileSync(path.join(process.cwd(), 'data', 'ashoka_info.txt'), 'utf-8');
+  const words = text.split(/\s+/);
+  const size = 100; // ~100 words per chunk
+  for (let i = 0; i < words.length; i += size - 20) {
+    chunks.push(words.slice(i, i + size).join(' '));
+  }
 }
 
-function chunkText(text, size, overlap) {
-  const res = [];
-  let i = 0;
-  while (i < text.length) {
-    res.push(text.slice(i, i + size));
-    i += size - overlap;
-    if (i >= text.length) break;
+// Simple BM25 scoring
+function bm25(query, doc, k1 = 1.2, b = 0.75) {
+  const qTerms = query.toLowerCase().split(/\s+/);
+  const dTerms = doc.toLowerCase().split(/\s+/);
+  const avgdl = chunks.reduce((a, c) => a + c.split(/\s+/).length, 0) / chunks.length;
+  const dl = dTerms.length;
+  let score = 0;
+
+  for (const term of qTerms) {
+    if (!dTerms.includes(term)) continue;
+    const tf = dTerms.filter(t => t === term).length;
+    const idf = Math.log(chunks.length / (1 + chunks.filter(c => c.includes(term)).length));
+    score += idf * (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (dl / avgdl)));
   }
-  return res;
+  return score;
 }
 
 const PROMPT = `You are an AI assistant for Ashoka Institute of Technology and Management, Varanasi.
@@ -58,33 +44,31 @@ Context:
 Question: {query}
 Answer:`;
 
-// === MAIN HANDLER ===
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).end();
-
   const { message } = req.body || {};
   if (!message?.trim()) return res.json({ response: 'Please type a question.' });
 
   try {
-    await init();
+    loadChunks();
 
-    // Retrieve
-    const qVec = await embedder.encode([message]);
-    const results = index.search(qVec, K);
-    const context = results.labels.map(i => chunks[i]).join('\n\n');
+    // Retrieve top 3 chunks using BM25
+    const scores = chunks.map((c, i) => ({ text: c, score: bm25(message, c), index: i }));
+    const top = scores.sort((a, b) => b.score - a.score).slice(0, 3);
+    const context = top.map(t => t.text).join('\n\n');
 
-    // Generate
-    const fullPrompt = PROMPT.replace('{context}', context).replace('{query}', message);
+    // Generate with HF
+    const full = PROMPT.replace('{context}', context).replace('{query}', message);
     const out = await hf.textGeneration({
       model: MODEL,
-      inputs: `[INST] ${fullPrompt} [/INST]`,
-      parameters: { max_new_tokens: 200, temperature: 0.3, return_full_text: false }
+      inputs: `[INST] ${full} [/INST]`,
+      parameters: { max_new_tokens: 180, temperature: 0.3 }
     });
 
     res.json({ response: out.generated_text.trim() });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ response: 'Service temporarily unavailable.' });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ response: 'Service unavailable.' });
   }
 }
 
